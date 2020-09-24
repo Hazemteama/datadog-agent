@@ -48,6 +48,8 @@ var (
 		[]string{"message_type", "state"}, "Count of service checks/events/metrics processed by dogstatsd")
 	tlmProcessedErrorTags = map[string]string{"message_type": "metrics", "state": "error"}
 	tlmProcessedOkTags    = map[string]string{"message_type": "metrics", "state": "ok"}
+
+	float64List = newFloat64ListPool()
 )
 
 func init() {
@@ -123,6 +125,10 @@ type metricsCountBuckets struct {
 
 // NewServer returns a running Dogstatsd server
 func NewServer(aggregator *aggregator.BufferedAggregator) (*Server, error) {
+	// TODO: we reset the pool to take into account the telemetry
+	// configuration. We should create it once here and once in the tests.
+	float64List = newFloat64ListPool()
+
 	var stats *util.Stats
 	if config.Datadog.GetBool("dogstatsd_stats_enable") == true {
 		buff := config.Datadog.GetInt("dogstatsd_stats_buffer")
@@ -393,7 +399,7 @@ func (s *Server) parsePackets(batcher *batcher, parser *parser, packets []*liste
 				}
 				batcher.appendEvent(event)
 			case metricSampleType:
-				sample, err := s.parseMetricMessage(parser, message, originTagger.getTags)
+				samples, err := s.parseMetricMessage(parser, message, originTagger.getTags)
 				if err != nil {
 					originTags := originTagger.getTags()
 					if len(originTags) > 0 {
@@ -403,15 +409,17 @@ func (s *Server) parsePackets(batcher *batcher, parser *parser, packets []*liste
 					}
 					continue
 				}
-				if atomic.LoadUint64(&s.Debug.Enabled) == 1 {
-					s.storeMetricStats(sample)
-				}
-				batcher.appendSample(sample)
-				if s.histToDist && sample.Mtype == metrics.HistogramType {
-					distSample := sample.Copy()
-					distSample.Name = s.histToDistPrefix + distSample.Name
-					distSample.Mtype = metrics.DistributionType
-					batcher.appendSample(*distSample)
+				for idx := range samples {
+					if atomic.LoadUint64(&s.Debug.Enabled) == 1 {
+						s.storeMetricStats(samples[idx])
+					}
+					batcher.appendSample(samples[idx])
+					if s.histToDist && samples[idx].Mtype == metrics.HistogramType {
+						distSample := samples[idx].Copy()
+						distSample.Name = s.histToDistPrefix + distSample.Name
+						distSample.Mtype = metrics.DistributionType
+						batcher.appendSample(*distSample)
+					}
 				}
 			}
 		}
@@ -428,12 +436,12 @@ func (s *Server) errLog(format string, params ...interface{}) {
 	}
 }
 
-func (s *Server) parseMetricMessage(parser *parser, message []byte, originTagsFunc func() []string) (metrics.MetricSample, error) {
+func (s *Server) parseMetricMessage(parser *parser, message []byte, originTagsFunc func() []string) ([]metrics.MetricSample, error) {
 	sample, err := parser.parseMetricSample(message)
 	if err != nil {
 		dogstatsdMetricParseErrors.Add(1)
 		tlmProcessed.IncWithTags(tlmProcessedErrorTags)
-		return metrics.MetricSample{}, err
+		return nil, err
 	}
 	if s.mapper != nil {
 		mapResult := s.mapper.Map(sample.name)
@@ -443,11 +451,13 @@ func (s *Server) parseMetricMessage(parser *parser, message []byte, originTagsFu
 			sample.tags = append(sample.tags, mapResult.Tags...)
 		}
 	}
-	metricSample := enrichMetricSample(sample, s.metricPrefix, s.metricPrefixBlacklist, s.defaultHostname, originTagsFunc, s.entityIDPrecedenceEnabled)
-	metricSample.Tags = append(metricSample.Tags, s.extraTags...)
-	dogstatsdMetricPackets.Add(1)
-	tlmProcessed.IncWithTags(tlmProcessedOkTags)
-	return metricSample, nil
+	metricSamples := enrichMetricSample(sample, s.metricPrefix, s.metricPrefixBlacklist, s.defaultHostname, originTagsFunc, s.entityIDPrecedenceEnabled)
+	for idx := range metricSamples {
+		metricSamples[idx].Tags = append(metricSamples[idx].Tags, s.extraTags...)
+		dogstatsdMetricPackets.Add(1)
+		tlmProcessed.IncWithTags(tlmProcessedOkTags)
+	}
+	return metricSamples, nil
 }
 
 func (s *Server) parseEventMessage(parser *parser, message []byte, originTagsFunc func() []string) (*metrics.Event, error) {
